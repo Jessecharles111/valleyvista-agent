@@ -1,4 +1,7 @@
 import os
+import asyncio
+import random
+import time
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -14,9 +17,36 @@ app.add_middleware(
 )
 
 MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
-MISTRAL_MODEL = os.getenv("MISTRAL_MODEL", "mistral-small-2603")
 MISTRAL_URL = "https://api.mistral.ai/v1/chat/completions"
 
+# ── Models (in fallback order) ──────────────────────────────
+# Small first (fastest, cheapest on free tier), then fallback
+MISTRAL_MODELS = [
+    os.getenv("MISTRAL_MODEL", "mistral-small-2603"),
+    "ministral-3b-2512",
+    "mistral-large-2512",
+]
+
+# ── GLOBAL RATE LIMITER ─────────────────────────────────────
+# Mistral free tier = 1 request per second.
+# Serialize all requests so we never exceed that limit.
+_rate_lock = asyncio.Lock()
+_last_call_time = 0.0
+MIN_INTERVAL_SECONDS = 1.5  # slightly above 1s to be safe
+
+
+async def _wait_for_rate_slot():
+    """Ensure at least MIN_INTERVAL_SECONDS between Mistral calls."""
+    global _last_call_time
+    async with _rate_lock:
+        now = time.monotonic()
+        elapsed = now - _last_call_time
+        if elapsed < MIN_INTERVAL_SECONDS:
+            await asyncio.sleep(MIN_INTERVAL_SECONDS - elapsed)
+        _last_call_time = time.monotonic()
+
+
+# ── SYSTEM PROMPT ───────────────────────────────────────────
 SYSTEM_PROMPT = """You are the official AI concierge for ValleyVista, a luxury real estate marketplace. You behave like a seasoned, trustworthy real estate manager with over 15 years of experience in high-end property transactions, rentals, and investment advisory. You speak with calm authority, warmth, and precision — never robotic, never pushy. Your role is to help visitors, buyers, renters, and sellers navigate ValleyVista confidently and feel that they are speaking to a true professional who has their best interest at heart.
 
 Your personality:
@@ -51,9 +81,89 @@ Your guidelines:
 You are the first voice of ValleyVista. Every visitor should leave the chat feeling respected, informed, and confident that ValleyVista is the right place to find their next home or investment.
 """
 
+
+# ── RETRY HELPER WITH RATE LIMITING ─────────────────────────
+async def call_mistral_with_retry(client, headers, payload, max_attempts=4):
+    """
+    Call Mistral with:
+    - Global rate limiting (never exceed 1 req / 1.5s)
+    - Exponential backoff on 429 / 5xx
+    - Model fallback chain
+    - Long waits to escape free-tier limits
+    Returns the last response or None if everything fails.
+    """
+    last_response = None
+
+    for model in MISTRAL_MODELS:
+        payload["model"] = model
+
+        for attempt in range(max_attempts):
+            # Wait for a free slot in the global rate limiter
+            await _wait_for_rate_slot()
+
+            try:
+                r = await client.post(MISTRAL_URL, headers=headers, json=payload)
+                last_response = r
+
+                if r.status_code == 200:
+                    print(f"[Agent] ✅ 200 from {model}")
+                    return r
+
+                # ── 429: rate limited ─────────────────────────
+                if r.status_code == 429:
+                    retry_after = r.headers.get("Retry-After")
+                    if retry_after:
+                        try:
+                            wait = float(retry_after)
+                        except ValueError:
+                            wait = 5 * (attempt + 1) + random.uniform(0, 2)
+                    else:
+                        wait = 5 * (attempt + 1) + random.uniform(0, 2)
+
+                    print(f"[Agent] ⏳ 429 on {model} (attempt {attempt+1}) — waiting {wait:.1f}s")
+                    await asyncio.sleep(wait)
+                    continue
+
+                # ── 5xx: server error ─────────────────────────
+                if r.status_code in (500, 502, 503, 504):
+                    wait = 3 * (attempt + 1) + random.uniform(0, 1)
+                    print(f"[Agent] ⚠️  {r.status_code} on {model} (attempt {attempt+1}) — waiting {wait:.1f}s")
+                    await asyncio.sleep(wait)
+                    continue
+
+                # ── Other error → try next model ──────────────
+                print(f"[Agent] ❌ {r.status_code} on {model} — trying fallback model")
+                break
+
+            except httpx.TimeoutException:
+                print(f"[Agent] ⏱️  Timeout on {model} (attempt {attempt+1})")
+                await asyncio.sleep(3 * (attempt + 1))
+                continue
+            except Exception as e:
+                print(f"[Agent] 💥 Error on {model}: {e}")
+                break
+
+    return last_response
+
+
+# ── GRACEFUL FALLBACK MESSAGE ───────────────────────────────
+FALLBACK_REPLY = (
+    "Thanks for reaching out! Our AI assistant is experiencing high demand right now. "
+    "I've passed your message to our team — an admin will reply here shortly. "
+    "You can also leave your phone number or email so we can reach you faster."
+)
+
+
+# ── ENDPOINTS ───────────────────────────────────────────────
 @app.get("/health")
 async def health():
-    return {"status": "ok", "model": MISTRAL_MODEL, "has_key": bool(MISTRAL_API_KEY)}
+    return {
+        "status": "ok",
+        "models": MISTRAL_MODELS,
+        "has_key": bool(MISTRAL_API_KEY),
+        "rate_limit": f"1 request per {MIN_INTERVAL_SECONDS}s",
+    }
+
 
 @app.post("/v1/chat/completions")
 async def chat(request: Request):
@@ -66,31 +176,68 @@ async def chat(request: Request):
     if not messages:
         return JSONResponse(status_code=400, content={"detail": "No messages"})
 
-    # Prepend system prompt if not already present
+    # Inject system prompt if not already present
     if not any(m.get("role") == "system" for m in messages):
         messages = [{"role": "system", "content": SYSTEM_PROMPT}] + messages
 
     if not MISTRAL_API_KEY:
-        return JSONResponse(status_code=500, content={"detail": "MISTRAL_API_KEY not configured"})
+        # Graceful degraded response instead of 500
+        return JSONResponse(
+            status_code=200,
+            content={
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "I'm offline right now. Please leave your message and an admin will reply soon."
+                    }
+                }],
+                "fallback": True,
+            },
+        )
 
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        try:
-            r = await client.post(
-                MISTRAL_URL,
-                headers={
-                    "Authorization": f"Bearer {MISTRAL_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": MISTRAL_MODEL,
-                    "messages": messages,
-                    "temperature": 0.6,
-                    "max_tokens": 800,
+    body = {
+        "messages": messages,
+        "temperature": 0.6,
+        "max_tokens": 800,
+    }
+
+    headers = {
+        "Authorization": f"Bearer {MISTRAL_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    async with httpx.AsyncClient(timeout=90.0) as client:
+        r = await call_mistral_with_retry(client, headers, body)
+
+        # If nothing worked, return graceful fallback (200, not 429)
+        if r is None or r.status_code != 200:
+            status = r.status_code if r else "no-response"
+            print(f"[Agent] 🛟 Returning fallback reply (upstream status: {status})")
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "choices": [{
+                        "message": {
+                            "role": "assistant",
+                            "content": FALLBACK_REPLY
+                        }
+                    }],
+                    "fallback": True,
+                    "upstream_status": status,
                 },
             )
+
+        try:
             data = r.json()
-            if r.status_code != 200:
-                return JSONResponse(status_code=r.status_code, content={"detail": data})
-            return data
-        except Exception as e:
-            return JSONResponse(status_code=500, content={"detail": f"Upstream error: {str(e)}"})
+        except Exception:
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "choices": [{
+                        "message": {"role": "assistant", "content": FALLBACK_REPLY}
+                    }],
+                    "fallback": True,
+                },
+            )
+
+        return JSONResponse(status_code=200, content=data)
